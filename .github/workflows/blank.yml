@@ -1,0 +1,104 @@
+name: CI/CD Pipeline
+on:
+  push:
+    branches:
+      - main
+      - staging
+      - dev
+  pull_request:
+    branches:
+      - main
+      - staging
+      - dev
+
+env:
+  SERVICES: "api-gateway,discovery-server,inventory-service,notification-service,order-service,product-service"
+  AWS_REGION: "us-west-2"
+
+jobs:
+  build-test-push-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 2
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Detect Changed Services
+        id: detect-changes
+        run: |
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+          CHANGED_SERVICES=""
+          for service in $(echo $SERVICES | tr ',' ' '); do
+            if echo "$CHANGED_FILES" | grep -q "^$service/"; then
+              CHANGED_SERVICES="$CHANGED_SERVICES,$service"
+            fi
+          done
+          CHANGED_SERVICES=${CHANGED_SERVICES#,}
+          echo "Changed services: $CHANGED_SERVICES"
+          echo "changed_services=$CHANGED_SERVICES" >> $GITHUB_OUTPUT
+
+      - name: Build and Test
+        if: steps.detect-changes.outputs.changed_services != ''
+        run: |
+          for service in $(echo "${{ steps.detect-changes.outputs.changed_services }}" | tr ',' ' '); do
+            cd $service
+            mvn clean package
+            cd ..
+          done
+
+      - name: Configure AWS Credentials
+        if: steps.detect-changes.outputs.changed_services != ''
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        if: steps.detect-changes.outputs.changed_services != ''
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, Tag, and Push Images to ECR
+        if: steps.detect-changes.outputs.changed_services != ''
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          for service in $(echo "${{ steps.detect-changes.outputs.changed_services }}" | tr ',' ' '); do
+            cd $service
+            docker build -t $ECR_REGISTRY/$service:$IMAGE_TAG .
+            docker push $ECR_REGISTRY/$service:$IMAGE_TAG
+            cd ..
+          done
+
+      - name: Set up kubectl
+        if: steps.detect-changes.outputs.changed_services != ''
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.21.0'
+
+      - name: Deploy to EKS
+        if: steps.detect-changes.outputs.changed_services != ''
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          ENVIRONMENT: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'stg' || 'dev' }}
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
+        run: |
+          # Decode and write kubeconfig
+          echo "$KUBECONFIG_DATA" | base64 -d > kubeconfig
+          export KUBECONFIG=$(pwd)/kubeconfig
+          
+          # Deploy changed services
+          for service in $(echo "${{ steps.detect-changes.outputs.changed_services }}" | tr ',' ' '); do
+            kubectl set image deployment/$service $service=$ECR_REGISTRY/$service:$IMAGE_TAG -n microservices-$ENVIRONMENT
+            kubectl rollout status deployment/$service -n microservices-$ENVIRONMENT
+          done
